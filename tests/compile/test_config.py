@@ -220,9 +220,7 @@ def test_use_cudagraphs(
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
 @pytest.mark.forked
-@pytest.mark.parametrize("use_v2_model_runner", [False, True])
-def test_stock_torch_compile(vllm_runner, monkeypatch, use_v2_model_runner):
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2_model_runner)))
+def test_stock_torch_compile(vllm_runner, monkeypatch):
     # Disable multiprocessing so that the counter is in the same process
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
@@ -589,17 +587,14 @@ def _mock_config_for_cudagraph_sizes(
     )
     config.num_speculative_tokens = VllmConfig.num_speculative_tokens.fget(config)
     config.uniform_decode_query_len = VllmConfig.uniform_decode_query_len.fget(config)
-    config.get_decode_cudagraph_query_lens = (
-        lambda decode_query_len: VllmConfig.get_decode_cudagraph_query_lens(
-            config, decode_query_len
-        )
+    config.get_decode_cudagraph_query_lens = lambda decode_query_len: (
+        VllmConfig.get_decode_cudagraph_query_lens(config, decode_query_len)
     )
-    config.get_draft_decode_cudagraph_request_sizes = (
-        lambda: VllmConfig.get_draft_decode_cudagraph_request_sizes(config)
+    config.get_draft_decode_cudagraph_request_sizes = lambda: (
+        VllmConfig.get_draft_decode_cudagraph_request_sizes(config)
     )
-    config.use_v2_model_runner = True
-    config._split_cudagraph_capture_sizes = (
-        lambda *args: VllmConfig._split_cudagraph_capture_sizes(config, *args)
+    config._split_cudagraph_capture_sizes = lambda *args: (
+        VllmConfig._split_cudagraph_capture_sizes(config, *args)
     )
     return config
 
