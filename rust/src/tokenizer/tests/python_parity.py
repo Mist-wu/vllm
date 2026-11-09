@@ -4,7 +4,11 @@
 
 Run from a vLLM checkout with vLLM installed (CPU is enough):
 
-    python rust/src/tokenizer/tests/python_parity.py [KEY ...]
+    python rust/src/tokenizer/tests/python_parity.py [--check] [KEY ...]
+
+Use --check in CI to compare with the current Python frontend without rewriting
+the snapshots. Dependency versions are provenance, not parity assertions: a
+version upgrade only requires regeneration if the token ids or contract change.
 
 For each tokenizer below, this loads the tokenizer the way the Python frontend
 does: `vllm.tokenizers.get_tokenizer` with the pinned revision, the recipe's
@@ -16,6 +20,7 @@ passes for a prompt without a length limit. The ids go to
 loads and the corpus digest.
 """
 
+import argparse
 import hashlib
 import json
 import shutil
@@ -206,17 +211,55 @@ def snapshot(
     )
 
 
-def generate(case: TokenizerCase, corpus: dict, corpus_sha256: str) -> None:
+def generate(
+    case: TokenizerCase, corpus: dict, corpus_sha256: str, *, check: bool = False
+) -> bool:
     tokenizer = load(case, case.model)
     special_token = tokenizer.eos_token
     ids = encode_corpus(tokenizer, corpus, special_token)
     check_overrides_ignored(case, corpus, special_token, ids)
     out = SNAPSHOT_DIR / f"{case.key}.json"
-    out.write_text(snapshot(case, corpus_sha256, special_token, ids), encoding="utf-8")
+    rendered = snapshot(case, corpus_sha256, special_token, ids)
+    if check:
+        if not out.is_file():
+            print(f"{case.key}: missing snapshot {out}", file=sys.stderr)
+            return False
+        expected = json.loads(out.read_text(encoding="utf-8"))
+        actual = json.loads(rendered)
+        for key in ("transformers", "tokenizers"):
+            expected.pop(key, None)
+            actual.pop(key, None)
+        if expected != actual:
+            fields = sorted(
+                key
+                for key in expected.keys() | actual.keys()
+                if expected.get(key) != actual.get(key)
+            )
+            changed_cases = sorted(
+                name
+                for name in expected.get("ids", {}).keys() | ids.keys()
+                if expected.get("ids", {}).get(name) != ids.get(name)
+            )
+            script = Path(__file__).relative_to(RECIPES_DIR.parents[1])
+            print(
+                f"{case.key}: stale snapshot; fields={fields}, cases={changed_cases}. "
+                f"Regenerate with: python {script} {case.key}",
+                file=sys.stderr,
+            )
+            return False
+        print(f"{case.key}: snapshot matches the Python frontend")
+        return True
+    out.write_text(rendered, encoding="utf-8")
     print(f"wrote {out} ({sum(map(len, ids.values()))} ids)")
+    return True
 
 
-def main(keys: list[str]) -> int:
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="fail on stale snapshots")
+    parser.add_argument("keys", nargs="*", help="tokenizer keys (default: all)")
+    args = parser.parse_args(argv)
+    keys = args.keys
     if envs.VLLM_USE_FASTOKENS:
         # `get_tokenizer` would then patch transformers with fastokens, so the
         # snapshots would hold fastokens' ids instead of the default frontend's.
@@ -230,9 +273,10 @@ def main(keys: list[str]) -> int:
     if unknown:
         print(f"unknown tokenizer keys: {sorted(unknown)}", file=sys.stderr)
         return 2
-    for case in selected:
-        generate(case, corpus, corpus_sha256)
-    return 0
+    matched = [
+        generate(case, corpus, corpus_sha256, check=args.check) for case in selected
+    ]
+    return 0 if all(matched) else 1
 
 
 if __name__ == "__main__":

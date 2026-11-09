@@ -1,6 +1,24 @@
 group: Rust Frontend Cargo
 depends_on: []
 steps:
+- label: ":computer: (CPU) Rust tokenizer Python snapshot freshness"
+  key: rust-tokenizer-python-parity
+  depends_on:
+  - image-build-cpu
+  timeout_in_minutes: 20
+  device: cpu-small
+  working_dir: "/vllm-workspace"
+  source_file_dependencies:
+  - rust/src/tokenizer/
+  - vllm/tokenizers/
+  - vllm/renderers/params.py
+  - vllm/transformers_utils/
+  - recipes/models/
+  - requirements/
+  - .buildkite/test_areas/rust_frontend_cargo.yaml
+  commands:
+  - python rust/src/tokenizer/tests/python_parity.py --check
+
 - label: ":computer: (CPU) Rust Frontend Cargo Style + Clippy"
   key: rust-frontend-cargo-style-clippy
   depends_on: []
