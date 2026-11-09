@@ -138,11 +138,6 @@ impl InferenceServiceImpl {
                 proto_request.sampling.as_ref().map_or(0, |sampling| sampling.num_sequences),
             )
             .unwrap_or(NonZeroU32::MIN);
-            if !stream && n > NonZeroU32::MIN {
-                return Err(Status::invalid_argument(
-                    "num_sequences > 1 is only supported by GenerateStream",
-                ));
-            }
             let max_n_sequences = self.state.api_server_options.max_n_sequences;
             if i64::from(n.get()) > max_n_sequences {
                 return Err(Status::invalid_argument(format!(
@@ -247,50 +242,69 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
         let PreparedGrpcRequest {
             text_request,
-            n: _,
+            n,
             request_span,
             started_at,
         } = self.prepare_request(proto_req, data_parallel_rank, false, "Generate").await?;
 
-        let stream = self
+        let streams = self
             .state
             .chat
             .text()
-            .generate(text_request)
+            .generate_n(text_request, n)
             .instrument(request_span.clone())
             .await
             .map_err(|error| log_text_error(&request_span, started_at, "submission", error))?;
 
-        let collected = stream
-            .collect_output()
-            .instrument(request_span.clone())
-            .await
-            .map_err(|error| log_text_error(&request_span, started_at, "collection", error))?;
-        // Build the single aggregated response.
-        let prompt_info = convert::to_prompt_info(
-            &collected.prompt_token_ids,
-            collected.prompt_logprobs.as_ref(),
-            &response_opts,
-        );
-
-        let finish_info = vllm_text::Finished {
-            usage: collected.usage,
-            finish_reason: collected.finish_reason,
-            kv_transfer_params: collected.kv_transfer_params.map(Box::new),
-            ec_transfer_params: collected.ec_transfer_params.map(Box::new),
-            sampling_mask: collected.sampling_mask,
-            spec_decode_metrics: collected.spec_decode_metrics,
-            weight_versions: collected.weight_versions,
-            timestamps: collected.timestamps,
-        };
-
-        let outputs = convert::to_sequence_output(
-            &collected.text,
-            &collected.token_ids,
-            collected.logprobs.as_ref(),
-            Some(&finish_info),
-            &response_opts,
-        )?;
+        // Convert each completed choice inside its future so an engine error
+        // fails the RPC immediately and drops the remaining generation streams.
+        let collected = futures::future::try_join_all(streams.into_iter().zip(0u32..).map(
+            |(stream, index)| {
+                let response_opts = &response_opts;
+                let request_span = &request_span;
+                async move {
+                    let collected = stream.collect_output().await.map_err(|error| {
+                        log_text_error(request_span, started_at, "collection", error)
+                    })?;
+                    let prompt_info = (index == 0).then(|| {
+                        convert::to_prompt_info(
+                            &collected.prompt_token_ids,
+                            collected.prompt_logprobs.as_ref(),
+                            response_opts,
+                        )
+                    });
+                    let finished = vllm_text::Finished {
+                        usage: collected.usage,
+                        finish_reason: collected.finish_reason,
+                        kv_transfer_params: collected.kv_transfer_params.map(Box::new),
+                        ec_transfer_params: collected.ec_transfer_params.map(Box::new),
+                        sampling_mask: collected.sampling_mask,
+                        spec_decode_metrics: collected.spec_decode_metrics,
+                        weight_versions: collected.weight_versions,
+                        timestamps: collected.timestamps,
+                    };
+                    let mut output = convert::to_sequence_output(
+                        &collected.text,
+                        &collected.token_ids,
+                        collected.logprobs.as_ref(),
+                        Some(&finished),
+                        response_opts,
+                    )?;
+                    output.index = index;
+                    Ok::<_, Status>((prompt_info, output))
+                }
+            },
+        ))
+        .instrument(request_span.clone())
+        .await?;
+        // try_join_all retains submission order even when choices finish in
+        // another order; only choice zero carries the shared prompt metadata.
+        let (prompts, mut sequences): (Vec<_>, Vec<_>) = collected.into_iter().unzip();
+        let prompt_info = prompts.into_iter().flatten().next();
+        let outputs = sequences.first().cloned();
+        if n == NonZeroU32::MIN {
+            sequences.clear();
+        }
         info!(
             parent: &request_span,
             elapsed_ms = started_at.elapsed().as_millis() as u64,
@@ -298,8 +312,9 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         );
 
         Ok(Response::new(pb::GenerateResponse {
-            prompt_info: Some(prompt_info),
-            outputs: Some(outputs),
+            prompt_info,
+            outputs,
+            sequences,
         }))
     }
 
@@ -375,6 +390,7 @@ async fn generate_stream_responses(
                 Ok(pb::GenerateResponse {
                     prompt_info: Some(prompt_info),
                     outputs: None,
+                    sequences: Vec::new(),
                 })
             }
             Ok(DecodedTextEvent::TextDelta {
@@ -397,6 +413,7 @@ async fn generate_stream_responses(
                 pb::GenerateResponse {
                     prompt_info: None,
                     outputs: Some(outputs),
+                    sequences: Vec::new(),
                 }
             }),
         };

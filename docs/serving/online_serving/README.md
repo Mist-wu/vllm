@@ -34,7 +34,7 @@ HTTP when `--grpc-port` is set:
 VLLM_USE_RUST_FRONTEND=1 vllm serve Qwen/Qwen3-0.6B --grpc-port 50051
 ```
 
-`GenerateStream` supports parallel sampling. Set `sampling.num_sequences` to the
+`Generate` and `GenerateStream` support parallel sampling. Set `sampling.num_sequences` to the
 number of candidates and `temperature` to a positive value. An omitted or zero
 `num_sequences` generates one candidate. The default temperature is `0.0` (greedy),
 which only supports one candidate. `VLLM_MAX_N_SEQUENCES` limits the number of
@@ -44,7 +44,13 @@ The stream sends `prompt_info` once. Each subsequent `outputs` message identifie
 its candidate with a zero-based `index`; candidates can return deltas and finish
 in any order. A candidate's `finish_info` marks only that candidate as complete.
 Read until the stream ends to receive all candidates. Disconnecting cancels the
-remaining candidates. The unary `Generate` RPC supports one candidate only.
+remaining candidates.
+
+For unary `Generate` with multiple candidates, the response's `sequences` field
+contains every completed candidate in index order. The existing `outputs` field
+also contains candidate zero for compatibility. Single-candidate responses keep
+using `outputs`, with an empty `sequences` list. Unary calls fail as a whole if a
+candidate fails, and cancel unfinished candidates on error or client disconnect.
 
 For the wire schema, see
 [`inference.proto`](https://github.com/vllm-project/vllm/blob/main/rust/proto/inference.proto).

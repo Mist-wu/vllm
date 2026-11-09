@@ -1765,7 +1765,7 @@ async fn streaming_generate_parallel_choices_finish_independently() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn generate_rejects_unsupported_parallel_sampling() {
+async fn generate_rejects_invalid_parallel_sampling() {
     let (mut client, server_task, _engine_task) = grpc_test_server(
         b"engine-grpc-parallel-validation",
         default_stream_output_specs(),
@@ -1781,30 +1781,226 @@ async fn generate_rejects_unsupported_parallel_sampling() {
         }),
         ..Default::default()
     };
-    let status = client.generate(request.clone()).await.expect_err("unary cannot return choices");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(status.message().contains("num_sequences"));
-
     for (n, temperature, expected) in [
         (2, None, "greedy"),
         (2, Some(0.0), "greedy"),
         (16_385, Some(1.0), "16384"),
     ] {
-        let status = client
-            .generate_stream(pb::GenerateRequest {
-                temperature,
+        let invalid = pb::GenerateRequest {
+            temperature,
+            sampling: Some(pb::RandomSampling {
+                num_sequences: n,
+                ..Default::default()
+            }),
+            ..request.clone()
+        };
+        for stream in [false, true] {
+            let status = if stream {
+                client
+                    .generate_stream(invalid.clone())
+                    .await
+                    .expect_err("invalid stream sampling")
+            } else {
+                client.generate(invalid.clone()).await.expect_err("invalid unary sampling")
+            };
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            assert!(status.message().contains(expected), "{status}");
+        }
+    }
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unary_parallel_choices_are_complete_ordered_and_backward_compatible() {
+    for n in [0u32, 1, 3] {
+        let (inference, control, health, engine_task) = setup_grpc_service_with_engine_script(
+            b"engine-grpc-unary-choices".to_vec(),
+            default_ready_response(),
+            Arc::new(FakeTextBackend::default()),
+            None,
+            move |dealer, push| {
+                boxed_test_future(async move {
+                    let mut requests = Vec::new();
+                    for _ in 0..n.max(1) {
+                        requests.push(decode_add_request(&recv_engine_message(dealer).await));
+                    }
+                    for (index, request) in requests.iter().enumerate().rev() {
+                        send_outputs(
+                            push,
+                            engine_outputs_for_request(
+                                &request.request_id,
+                                vec![
+                                    (vec![u32::from(b'a') + index as u32], None),
+                                    (
+                                        vec![u32::from(b'A') + index as u32],
+                                        Some(EngineCoreFinishReason::Length),
+                                    ),
+                                ],
+                            ),
+                        )
+                        .await;
+                    }
+                })
+            },
+        )
+        .await;
+        let (channel, server_task) = start_grpc_test_server(
+            inference,
+            control,
+            health,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let mut client = InferenceClient::new(channel);
+        let response = client
+            .generate(pb::GenerateRequest {
+                model: "test-model".into(),
+                prompt: Some(pb::generate_request::Prompt::Text("hello".into())),
+                temperature: Some(1.0),
                 sampling: Some(pb::RandomSampling {
                     num_sequences: n,
                     ..Default::default()
                 }),
-                ..request.clone()
+                response: Some(pb::ResponseOptions {
+                    output_text: Some(true),
+                    output_token_ids: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
             })
             .await
-            .expect_err("reject unsupported parallel sampling");
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains(expected), "{status}");
+            .expect("unary generation")
+            .into_inner();
+        assert_eq!(response.prompt_info.unwrap().num_prompt_tokens, 5);
+        let first = response.outputs.expect("legacy first output");
+        let sequences = if n <= 1 {
+            assert!(response.sequences.is_empty());
+            vec![first]
+        } else {
+            assert_eq!(response.sequences.len(), n as usize);
+            assert_eq!(first, response.sequences[0]);
+            response.sequences
+        };
+        for (index, output) in sequences.into_iter().enumerate() {
+            assert_eq!(output.index, index as u32);
+            assert_eq!(
+                output.token_ids,
+                [
+                    u32::from(b'a') + index as u32,
+                    u32::from(b'A') + index as u32
+                ]
+            );
+            assert_eq!(
+                output.text,
+                format!(
+                    "{}{}",
+                    (b'a' + index as u8) as char,
+                    (b'A' + index as u8) as char
+                )
+            );
+            assert_eq!(output.num_tokens, 2);
+            let finish = output.finish_info.expect("every sequence finishes");
+            assert_eq!(finish.num_output_tokens, 2);
+            assert_eq!(
+                finish.finish_reason,
+                pb::finish_info::FinishReason::Length as i32
+            );
+        }
+        engine_task.await.expect("engine task");
+        server_task.abort();
     }
-    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn unary_parallel_choices_cancel_on_disconnect_or_error() {
+    for fail in [false, true] {
+        let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();
+        let (inference, control, health, engine_task) = setup_grpc_service_with_engine_script(
+            b"engine-grpc-unary-cancel".to_vec(),
+            default_ready_response(),
+            Arc::new(FakeTextBackend::default()),
+            None,
+            move |dealer, push| {
+                boxed_test_future(async move {
+                    let mut pending = Vec::new();
+                    for _ in 0..3 {
+                        pending.push(
+                            decode_add_request(&recv_engine_message(dealer).await).request_id,
+                        );
+                    }
+                    if fail {
+                        let failed = pending.remove(0);
+                        send_outputs(
+                            push,
+                            engine_outputs_for_request(
+                                &failed,
+                                vec![(Vec::new(), Some(EngineCoreFinishReason::Error))],
+                            ),
+                        )
+                        .await;
+                    }
+                    submitted_tx.send(()).expect("submitted choices");
+                    while !pending.is_empty() {
+                        let abort = recv_engine_message(dealer).await;
+                        assert_eq!(abort[0].as_ref(), &[0x01]);
+                        let ids: Vec<String> = rmp_serde::from_slice(&abort[1]).expect("abort IDs");
+                        for id in ids {
+                            let index = pending
+                                .iter()
+                                .position(|value| value == &id)
+                                .expect("each pending choice is cancelled once");
+                            pending.remove(index);
+                        }
+                    }
+                })
+            },
+        )
+        .await;
+        let (channel, server_task) = start_grpc_test_server(
+            inference,
+            control,
+            health,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let mut client = InferenceClient::new(channel);
+        let call = tokio::spawn(async move {
+            client
+                .generate(pb::GenerateRequest {
+                    model: "test-model".into(),
+                    prompt: Some(pb::generate_request::Prompt::Text("hello".into())),
+                    temperature: Some(1.0),
+                    sampling: Some(pb::RandomSampling {
+                        num_sequences: 3,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), submitted_rx)
+            .await
+            .expect("submission timeout")
+            .expect("submission signal");
+        if fail {
+            let status = tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("error response timeout")
+                .expect("client task")
+                .expect_err("one failed choice fails the unary request");
+            assert_eq!(status.code(), tonic::Code::Internal);
+        } else {
+            call.abort();
+            assert!(call.await.expect_err("client cancelled").is_cancelled());
+        }
+        tokio::time::timeout(Duration::from_secs(5), engine_task)
+            .await
+            .expect("cancellation timeout")
+            .expect("engine task");
+        server_task.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

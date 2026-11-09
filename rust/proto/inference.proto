@@ -185,7 +185,12 @@ message CandidateTokens {
 message GenerateResponse {
   // Only present in first response
   optional PromptInfo prompt_info = 1;
+  // The single sequence for streaming responses. For unary responses this is
+  // sequence zero, retained for clients using the original single-output API.
   SequenceOutput outputs = 2;
+  // Unary Generate with num_sequences > 1: all complete outputs in index order.
+  // Empty for streaming responses and single-sequence unary requests.
+  repeated SequenceOutput sequences = 3;
 }
 
 message SequenceOutput {
