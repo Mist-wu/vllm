@@ -1070,7 +1070,7 @@ async fn unary_generate_prepares_multimodal_input_for_engine_core() {
 /// sent through gRPC to the engine, not only parse into a processor config.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn grpc_image_max_pixels_override_changes_engine_features() {
+async fn grpc_image_overrides_isolate_cache_keys_and_restore_defaults() {
     // A 256x256 PNG: large enough for a Qwen2-VL pixel budget to affect
     // patch expansion. The same source image is used for both requests.
     const PNG_DATA_URI: &str = concat!(
@@ -1085,85 +1085,114 @@ async fn grpc_image_max_pixels_override_changes_engine_features() {
         "AAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAAYAAwABgADAAGAAOAAcAA",
         "YAAwABgADAAGAAOAAcAAYAAwAFwL4YoXrXbgQbEAAAAASUVORK5CYII="
     );
-    let observed_lengths = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
-    for (index, max_pixels) in [None, Some(3_136_usize)].into_iter().enumerate() {
-        let recorded = Arc::clone(&observed_lengths);
-        let (inference_service, control_service, health, engine_task) =
-            setup_grpc_service_with_backend_trust(
-                if index == 0 {
-                    b"engine-grpc-image-baseline"
-                } else {
-                    b"engine-grpc-image-override"
-                },
-                default_stream_output_specs(),
-                multimodal_backend_with_config(
-                    Default::default(),
-                    Some(r#"{"min_pixels":3136,"max_pixels":65536}"#),
-                ),
-                move |request| {
-                    let features =
-                        request.mm_features.as_ref().expect("image features in engine request");
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&observations);
+    let budgets = [
+        None,
+        Some(3_136),
+        Some(12_544),
+        Some(3_136),
+        None,
+        Some(3_136),
+    ];
+    let (inference, control, health, engine_task) = setup_grpc_service_with_engine_script_trust(
+        b"engine-grpc-image-cache-isolation",
+        default_ready_response(),
+        multimodal_backend_with_config(
+            Default::default(),
+            Some(r#"{"min_pixels":3136,"max_pixels":65536}"#),
+        ),
+        None,
+        true,
+        move |dealer, push| {
+            boxed_test_future(async move {
+                for _ in budgets {
+                    let add = recv_engine_message(dealer).await;
+                    let request = decode_add_request(&add);
+                    let features = request.mm_features.as_ref().expect("engine image features");
                     assert_eq!(features.len(), 1);
-                    assert_eq!(features[0].modality.as_str(), "image");
-                    if index == 0 {
-                        assert_eq!(features[0].identifier, "image-max-pixels");
-                    } else {
-                        assert_ne!(features[0].identifier, "image-max-pixels");
-                        assert!(
-                            features[0]
-                                .mm_hash
-                                .as_ref()
-                                .is_some_and(|hash| hash.starts_with("mm-override-v1:"))
-                        );
-                    }
-                    recorded
-                        .lock()
-                        .expect("record image length")
-                        .push(features[0].mm_position.length);
-                },
-                true,
-            )
-            .await;
-        let (channel, server_task) = start_grpc_test_server(
-            inference_service,
-            control_service,
-            health,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
-        let mut client = InferenceClient::new(channel);
-        client
-            .generate(pb::GenerateRequest {
-                model: "test-model".to_string(),
-                request_id: format!("test-image-max-pixels-{index}"),
-                prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-                    ids: vec![11, QWEN_IMAGE_TOKEN_ID, 13],
-                })),
-                media: vec![pb::MediaItem {
-                    modality: pb::Modality::Image as i32,
-                    source: Some(pb::media_item::Source::DataUri(PNG_DATA_URI.to_string())),
-                    mime_type: String::new(),
-                    uuid: "image-max-pixels".to_string(),
-                }],
-                mm_processor_kwargs: max_pixels.map(|max_pixels| {
-                    json_to_proto_struct(&serde_json::json!({"max_pixels": max_pixels}))
-                        .expect("valid processor override")
-                }),
-                ..Default::default()
+                    let feature = &features[0];
+                    assert_eq!(feature.modality.as_str(), "image");
+                    recorded.lock().expect("record features").push((
+                        feature.mm_position.length,
+                        feature.identifier.clone(),
+                        feature.mm_hash.clone(),
+                    ));
+                    send_outputs(
+                        push,
+                        engine_outputs_for_request(
+                            &request.request_id,
+                            default_stream_output_specs(),
+                        ),
+                    )
+                    .await;
+                }
             })
-            .await
-            .expect("gRPC image generation should succeed");
-        engine_task.await.expect("mock engine task");
-        server_task.abort();
+        },
+    )
+    .await;
+    let (channel, server_task) = start_grpc_test_server(
+        inference,
+        control,
+        health,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let mut client = InferenceClient::new(channel);
+    for (index, max_pixels) in budgets.into_iter().enumerate() {
+        let request = pb::GenerateRequest {
+            model: "test-model".to_string(),
+            request_id: format!("test-image-cache-{index}"),
+            prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
+                ids: vec![11, QWEN_IMAGE_TOKEN_ID, 13],
+            })),
+            media: vec![pb::MediaItem {
+                modality: pb::Modality::Image as i32,
+                source: Some(pb::media_item::Source::DataUri(PNG_DATA_URI.to_string())),
+                mime_type: String::new(),
+                uuid: "shared-image-uuid".to_string(),
+            }],
+            mm_processor_kwargs: max_pixels.map(|value| {
+                json_to_proto_struct(&serde_json::json!({"max_pixels": value}))
+                    .expect("processor override")
+            }),
+            ..Default::default()
+        };
+        if index == budgets.len() - 1 {
+            let mut stream =
+                client.generate_stream(request).await.expect("stream image").into_inner();
+            while stream.message().await.expect("stream response").is_some() {}
+        } else {
+            client.generate(request).await.expect("generate image");
+        }
     }
-    let lengths = observed_lengths.lock().expect("recorded image token lengths");
-    assert_eq!(lengths.len(), 2);
+    engine_task.await.expect("engine task");
+    server_task.abort();
+    let seen = observations.lock().expect("recorded observations");
+    assert_eq!(seen.len(), budgets.len());
     assert!(
-        lengths[1] < lengths[0],
-        "lower max_pixels should produce fewer image tokens; baseline={}, overridden={}",
-        lengths[0],
-        lengths[1]
+        seen[0].0 > seen[2].0 && seen[2].0 > seen[1].0,
+        "pixel budgets must alter engine feature lengths: {seen:?}"
     );
+    assert_eq!(seen[0], seen[4], "defaults survive intervening overrides");
+    assert_eq!(
+        seen[1], seen[3],
+        "repeated overrides have stable cache identities"
+    );
+    assert_eq!(
+        seen[1], seen[5],
+        "unary and streaming share cache identities"
+    );
+    assert_eq!(seen[0].1, "shared-image-uuid");
+    for index in [1, 2] {
+        assert_ne!(
+            seen[index].1, seen[0].1,
+            "encoder cache must include overrides"
+        );
+        assert!(seen[index].2.as_ref().is_some_and(|key| key.starts_with("mm-override-v1:")));
+    }
+    assert_ne!(seen[1].1, seen[2].1);
+    assert_ne!(seen[1].2, seen[2].2);
 }
 
 /// Untrusted gRPC clients may not enable per-request media or processor kwargs.
