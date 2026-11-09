@@ -34,6 +34,21 @@ vllm serve <hybrid-model> \
 
 Choose a value that divides the block size of every prefix-cacheable KV cache group, and that is a multiple of the per-state compression ratio for models that use one, such as sparse MLA. vLLM validates both at startup and names the offending sizes in the error. Read the served block size from the startup log. 64 is a reasonable starting point.
 
+### Prefill CUDA graph coverage
+
+With prefix caching enabled, hybrid models use Mamba cache mode `align`. Their prefill batches can exceed the largest captured prefill CUDA graph, including when a backend saves Mamba checkpoints within a single large chunk. Batches above that limit execute without CUDA graph replay, which can increase CPU dispatch overhead and prefill latency.
+
+vLLM warns at startup when prefill graphs are enabled but their capture limit is below `max_num_batched_tokens`. Set `max_prefill_cudagraph_capture_tokens` to cover the prefill sizes your workload needs, or choose explicit token counts with `prefill_cudagraph_capture_token_sizes`. For example, to cover a 2048-token batch budget:
+
+```bash
+vllm serve Qwen/Qwen3.5-0.8B \
+    --enable-prefix-caching \
+    --max-num-batched-tokens 2048 \
+    --compilation-config '{"max_prefill_cudagraph_capture_tokens": 2048}'
+```
+
+Larger captures consume additional GPU memory and increase startup time; measure these costs alongside cold-prefill latency before increasing the limit. Decode capture sizes count requests and do not extend prefill coverage. Intentional eager or decode-only graph execution does not trigger this warning.
+
 ### FlashInfer ReplaySSM
 
 FlashInfer ReplaySSM caches recent inputs to reduce full-state writes during Mamba2 decoding. It is disabled by default. Both Model Runners V1 and V2 support prefix caching with ReplaySSM, including MTP speculative decoding.

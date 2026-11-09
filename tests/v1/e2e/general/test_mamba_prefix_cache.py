@@ -59,6 +59,32 @@ cur_step_action: StepAction | None = None
 step_actions: list[StepAction] = []
 
 
+@pytest.mark.parametrize(
+    ("prefill_limit", "enforce_eager", "warns"),
+    [(512, False, True), (1024, False, False), (512, True, False)],
+)
+def test_mamba_prefill_cudagraph_warning(
+    vllm_runner, capfd, prefill_limit, enforce_eager, warns
+):
+    """Engine startup diagnoses uncovered prefill batches for a real hybrid model."""
+    with vllm_runner(
+        "Qwen/Qwen3.5-0.8B",
+        max_model_len=2048,
+        max_num_batched_tokens=1024,
+        max_num_seqs=16,
+        gpu_memory_utilization=0.6,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        block_size=None,
+        language_model_only=True,
+        enforce_eager=enforce_eager,
+        compilation_config={"max_prefill_cudagraph_capture_tokens": prefill_limit},
+    ) as runner:
+        output = capfd.readouterr()
+        assert ("Prefill batches above this limit" in output.out + output.err) is warns
+        assert runner.generate_greedy(["The capital of France is"], max_tokens=1)[0][0]
+
+
 def get_fake_step_action_fn(original_step_action_fn: Callable):
     def fake_get_output(self: InprocClient):
         global cur_step_action_idx

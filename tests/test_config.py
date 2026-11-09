@@ -3155,23 +3155,61 @@ def test_vllm_config_defaults_are_none():
 
 def test_validate_mamba_align_subblock_prefill():
     """Align mode permits configured prefill chunks smaller than a block."""
-    config = SimpleNamespace(
-        cache_config=SimpleNamespace(
+    config = VllmConfig(
+        cache_config=CacheConfig(
             block_size=11392,
             mamba_cache_mode="align",
         ),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
-        ),
-        scheduler_config=SimpleNamespace(
+        scheduler_config=SchedulerConfig(
+            max_model_len=16384,
+            is_encoder_decoder=False,
             max_num_batched_tokens=8192,
             long_prefill_token_threshold=4096,
-            disable_chunked_mm_input=False,
         ),
-        kv_transfer_config=None,
+        compilation_config=CompilationConfig(cudagraph_mode=CUDAGraphMode.NONE),
     )
 
-    VllmConfig.validate_block_size(config)
+    config.validate_block_size()
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "graph_mode", "prefill_limit", "warns"),
+    [
+        ("align", CUDAGraphMode.PIECEWISE, 512, True),
+        ("align", CUDAGraphMode.PIECEWISE, 1024, False),
+        ("align", CUDAGraphMode.PIECEWISE, 0, False),
+        ("align", CUDAGraphMode.FULL_DECODE_ONLY, 512, False),
+        ("align", CUDAGraphMode.NONE, 512, False),
+        ("none", CUDAGraphMode.PIECEWISE, 512, False),
+    ],
+)
+def test_mamba_prefill_cudagraph_coverage_warning(
+    cache_mode, graph_mode, prefill_limit, warns, caplog_vllm
+):
+    """Larger decode captures must not hide a gap in prefill coverage."""
+    config = VllmConfig(
+        model_config=ModelConfig("Qwen/Qwen3.5-0.8B", max_model_len=2048),
+        cache_config=CacheConfig(
+            mamba_cache_mode=cache_mode,
+            enable_prefix_caching=cache_mode == "align",
+        ),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            max_num_seqs=1024,
+            max_num_batched_tokens=1024,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=graph_mode,
+            max_prefill_cudagraph_capture_tokens=prefill_limit,
+            decode_cudagraph_capture_request_sizes=[1024],
+        ),
+    )
+    expected_max = 0 if graph_mode == CUDAGraphMode.NONE else 1024
+    assert config.compilation_config.max_cudagraph_capture_size == expected_max
+    with caplog_vllm.at_level(logging.WARNING):
+        config.validate_block_size()
+    assert ("Prefill batches above this limit" in caplog_vllm.text) is warns
 
 
 @pytest.mark.parametrize(

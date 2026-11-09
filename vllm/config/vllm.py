@@ -3538,6 +3538,25 @@ class VllmConfig:
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
             )
+            compilation_config = self.compilation_config
+            prefill_limit = compilation_config.max_prefill_cudagraph_capture_tokens or 0
+            token_budget = self.scheduler_config.max_num_batched_tokens
+            if (
+                compilation_config.cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE
+                and 0 < prefill_limit < token_budget
+            ):
+                logger.warning_once(
+                    "Mamba cache mode 'align' allows prefill batches up to "
+                    "max_num_batched_tokens=%d, but the largest prefill CUDA "
+                    "graph captures %d tokens. Prefill batches above this "
+                    "limit cannot replay CUDA graphs. Consider increasing "
+                    "max_prefill_cudagraph_capture_tokens or "
+                    "prefill_cudagraph_capture_token_sizes to cover the "
+                    "prefill workload, at the cost of additional GPU memory "
+                    "and startup time.",
+                    token_budget,
+                    prefill_limit,
+                )
 
     @model_validator(mode="after")
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
